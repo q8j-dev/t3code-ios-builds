@@ -1,4 +1,4 @@
-name: Build Unsigned T3 Code IPA
+name: Build iOS iPA
 
 on:
   workflow_dispatch:
