@@ -1,0 +1,185 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build T3 Code iOS
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      APP_VARIANT: production
+      EXPO_NO_GIT_STATUS: "1"
+
+      T3CODE_IOS_PERSONAL_TEAM: "1"
+
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: com.t3.t3code
+
+    steps:
+      - name: Checkout T3 Code
+        uses: actions/checkout@v6
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select \
+            --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install Node, Vite+, and dependencies
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Generate native iOS project
+        working-directory: apps/mobile
+        run: |
+          ./node_modules/.bin/expo prebuild \
+            --clean \
+            --platform ios
+
+      - name: Install CocoaPods
+        working-directory: apps/mobile
+        run: |
+          pod install --project-directory=ios
+
+      - name: Find Xcode workspace and scheme
+        id: xcode
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$(find ios -maxdepth 1 \
+            -name '*.xcworkspace' \
+            -print \
+            -quit)"
+
+          if [[ -z "$WORKSPACE" ]]; then
+            echo "No Xcode workspace was generated."
+            exit 1
+          fi
+
+          SCHEME="$(
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              -list \
+              -json |
+            python3 -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+          schemes = data.get("workspace", {}).get("schemes", [])
+
+          preferred = [
+              scheme for scheme in schemes
+              if "t3" in scheme.lower() and "pod" not in scheme.lower()
+          ]
+
+          if not preferred:
+              preferred = [
+                  scheme for scheme in schemes
+                  if "pod" not in scheme.lower()
+              ]
+
+          if not preferred:
+              raise SystemExit("No usable Xcode scheme found")
+
+          print(preferred[0])
+          '
+          )"
+
+          echo "Workspace: $WORKSPACE"
+          echo "Scheme: $SCHEME"
+
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned Release app
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -o pipefail
+
+          xcodebuild \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build |
+          tee xcodebuild.log
+
+      - name: Package unsigned IPA
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(
+            find build/Build/Products/Release-iphoneos \
+              -maxdepth 1 \
+              -type d \
+              -name '*.app' \
+              -print \
+              -quit
+          )"
+
+          if [[ -z "$APP" ]]; then
+            echo "Built application was not found."
+            find build/Build/Products -maxdepth 4 -print || true
+            exit 1
+          fi
+
+          echo "Packaging: $APP"
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+
+          find Payload -type d -name '_CodeSignature' \
+            -prune -exec rm -rf {} +
+
+          find Payload -name 'embedded.mobileprovision' \
+            -delete
+
+          /usr/bin/ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            Payload \
+            T3-Code-unsigned.ipa
+
+          unzip -l T3-Code-unsigned.ipa | head -50
+          ls -lh T3-Code-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3-Code-iOS-Unsigned
+          path: apps/mobile/T3-Code-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3-Code-iOS-Build-Log
+          path: apps/mobile/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
