@@ -8,36 +8,46 @@ permissions:
 
 jobs:
   build-ios:
-    name: Build unsigned iOS IPA
-    runs-on: macos-15
-    timeout-minutes: 90
+    name: Build iOS iPA
+    runs-on: macos-26
+    timeout-minutes: 120
 
     env:
+      CI: "1"
       APP_VARIANT: production
       EXPO_NO_GIT_STATUS: "1"
-      CI: "1"
 
-      # Generates a reduced-capability build that is easier to sideload.
+      # Produces the reduced-capability Personal Team build.
       T3CODE_IOS_PERSONAL_TEAM: "1"
 
-      # Change this when needed.
+      # Bundle identifier embedded in the unsigned app.
       T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: com.t3.t3code
 
     steps:
       - name: Checkout T3 Code
         uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: main
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
 
-      - name: Select Xcode 26.3
+      - name: Select Xcode 26.6
         shell: bash
         run: |
           set -euo pipefail
 
-          XCODE_PATH="/Applications/Xcode_26.3.app"
+          XCODE_PATH="/Applications/Xcode_26.6.app"
 
           if [[ ! -d "$XCODE_PATH" ]]; then
-            echo "Xcode 26.3 was not found."
+            echo "::error::Xcode 26.6 was not found."
             echo "Installed Xcode versions:"
-            ls -1 /Applications | grep '^Xcode' || true
+            find /Applications \
+              -maxdepth 1 \
+              -type d \
+              -name 'Xcode*.app' \
+              -print
             exit 1
           fi
 
@@ -50,6 +60,9 @@ jobs:
           echo "Selected Swift:"
           xcrun swift --version
 
+          echo "Selected iOS SDK:"
+          xcrun --sdk iphoneos --show-sdk-version
+
       - name: Set up Vite+ and Node
         uses: voidzero-dev/setup-vp@v1
         with:
@@ -57,38 +70,53 @@ jobs:
           cache: true
           run-install: true
 
-      - name: Display tool versions
+      - name: Show tool versions
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Node:"
           node --version
+
+          echo "Vite+:"
           vp --version
+
+          echo "CocoaPods:"
           pod --version
+
+          echo "Xcode:"
           xcodebuild -version
+
+          echo "Swift:"
           xcrun swift --version
 
-      - name: Generate the native iOS project
+      - name: Generate native iOS project
         working-directory: apps/mobile
         shell: bash
         run: |
           set -euo pipefail
+          set -o pipefail
+
+          rm -rf ios build output
 
           ./node_modules/.bin/expo prebuild \
             --clean \
-            --platform ios
+            --platform ios \
+            2>&1 | tee expo-prebuild.log
 
-      - name: Install CocoaPods dependencies
+      - name: Install CocoaPods
         working-directory: apps/mobile
         shell: bash
         run: |
           set -euo pipefail
+          set -o pipefail
 
           pod install \
-            --project-directory=ios
+            --project-directory=ios \
+            2>&1 | tee pod-install.log
 
-      - name: Locate Xcode workspace
-        id: workspace
+      - name: Locate workspace and scheme
+        id: xcode
         working-directory: apps/mobile
         shell: bash
         run: |
@@ -99,123 +127,157 @@ jobs:
               -maxdepth 1 \
               -type d \
               -name '*.xcworkspace' \
+              ! -name 'Pods.xcworkspace' \
               -print \
               -quit
           )"
 
           if [[ -z "$WORKSPACE" ]]; then
-            echo "No Xcode workspace was generated."
-            find ios -maxdepth 2 -print || true
+            echo "::error::No application Xcode workspace was found."
+            find ios -maxdepth 3 -print || true
+            exit 1
+          fi
+
+          PROJECT="$(
+            find ios \
+              -maxdepth 1 \
+              -type d \
+              -name '*.xcodeproj' \
+              ! -name 'Pods.xcodeproj' \
+              -print \
+              -quit
+          )"
+
+          if [[ -z "$PROJECT" ]]; then
+            echo "::error::No application Xcode project was found."
+            find ios -maxdepth 3 -print || true
+            exit 1
+          fi
+
+          PROJECT_NAME="$(basename "$PROJECT" .xcodeproj)"
+
+          PREFERRED_SCHEME_FILE="$PROJECT/xcshareddata/xcschemes/$PROJECT_NAME.xcscheme"
+          SCHEME_FILE=""
+
+          if [[ -f "$PREFERRED_SCHEME_FILE" ]]; then
+            SCHEME_FILE="$PREFERRED_SCHEME_FILE"
+          else
+            SCHEME_FILE="$(
+              find ios \
+                -type f \
+                -path '*/xcshareddata/xcschemes/*.xcscheme' \
+                ! -path '*/Pods/*' \
+                -print \
+                -quit
+            )"
+          fi
+
+          if [[ -z "$SCHEME_FILE" || ! -f "$SCHEME_FILE" ]]; then
+            echo "::error::No shared application scheme was found."
+            echo "Available scheme files:"
+            find ios -type f -name '*.xcscheme' -print || true
+            exit 1
+          fi
+
+          SCHEME="$(basename "$SCHEME_FILE" .xcscheme)"
+
+          if [[ -z "$SCHEME" ]]; then
+            echo "::error::The detected Xcode scheme was empty."
             exit 1
           fi
 
           echo "Workspace: $WORKSPACE"
-          echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "Project:   $PROJECT"
+          echo "Scheme:    $SCHEME"
+          echo "Scheme file: $SCHEME_FILE"
+
+          {
+            echo "workspace=$WORKSPACE"
+            echo "project=$PROJECT"
+            echo "scheme=$SCHEME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify detected scheme
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          xcodebuild \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
+            -configuration Release \
+            -showBuildSettings \
+            2>&1 | tee xcode-build-settings.log
 
       - name: Resolve Swift package dependencies
         working-directory: apps/mobile
         shell: bash
         run: |
           set -euo pipefail
+          set -o pipefail
+
+          mkdir -p build/SourcePackages
 
           xcodebuild \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -clonedSourcePackagesDirPath "$PWD/build/SourcePackages" \
             -resolvePackageDependencies \
-            -workspace "${{ steps.workspace.outputs.path }}"
-
-      - name: Locate Xcode scheme
-        id: scheme
-        working-directory: apps/mobile
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          JSON_FILE="$RUNNER_TEMP/t3code-xcode-list.json"
-
-          xcodebuild \
-            -workspace "${{ steps.workspace.outputs.path }}" \
-            -list \
-            -json \
-            > "$JSON_FILE"
-
-          echo "Xcode workspace information:"
-          cat "$JSON_FILE"
-
-          SCHEME="$(
-            python3 - "$JSON_FILE" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-
-          with path.open("r", encoding="utf-8") as file:
-              data = json.load(file)
-
-          schemes = data.get("workspace", {}).get("schemes", [])
-
-          usable = [
-              scheme
-              for scheme in schemes
-              if "pod" not in scheme.lower()
-          ]
-
-          preferred = [
-              scheme
-              for scheme in usable
-              if "t3" in scheme.lower()
-          ]
-
-          choices = preferred or usable
-
-          if not choices:
-              raise SystemExit("No usable Xcode scheme was found.")
-
-          print(choices[0])
-          PY
-          )"
-
-          if [[ -z "$SCHEME" ]]; then
-            echo "Scheme detection produced an empty result."
-            exit 1
-          fi
-
-          echo "Selected scheme: $SCHEME"
-          echo "name=$SCHEME" >> "$GITHUB_OUTPUT"
+            2>&1 | tee swiftpm-resolve.log
 
       - name: Build unsigned Release app
         working-directory: apps/mobile
         shell: bash
         run: |
+          set -euo pipefail
           set -o pipefail
 
-          rm -rf build
+          rm -rf build/Build build/Logs build/Info.plist
 
           xcodebuild \
-            -workspace "${{ steps.workspace.outputs.path }}" \
-            -scheme "${{ steps.scheme.outputs.name }}" \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -derivedDataPath "$PWD/build" \
+            -clonedSourcePackagesDirPath "$PWD/build/SourcePackages" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             build \
-            | tee xcodebuild.log
+            2>&1 | tee xcodebuild.log
 
-      - name: Find built application
+      - name: Locate built application
         id: app
         working-directory: apps/mobile
         shell: bash
         run: |
           set -euo pipefail
 
+          PRODUCTS_DIRECTORY="$PWD/build/Build/Products/Release-iphoneos"
+
+          if [[ ! -d "$PRODUCTS_DIRECTORY" ]]; then
+            echo "::error::Release-iphoneos products directory does not exist."
+            find build -maxdepth 5 -print || true
+            exit 1
+          fi
+
           APP_PATH="$(
-            find build/Build/Products/Release-iphoneos \
+            find "$PRODUCTS_DIRECTORY" \
+              -mindepth 1 \
               -maxdepth 1 \
               -type d \
               -name '*.app' \
@@ -224,13 +286,41 @@ jobs:
           )"
 
           if [[ -z "$APP_PATH" ]]; then
-            echo "The built application could not be found."
-            find build/Build/Products -maxdepth 5 -print || true
+            echo "::error::No built .app was found."
+            find "$PRODUCTS_DIRECTORY" -maxdepth 4 -print || true
+            exit 1
+          fi
+
+          INFO_PLIST="$APP_PATH/Info.plist"
+
+          if [[ ! -f "$INFO_PLIST" ]]; then
+            echo "::error::The built app does not contain Info.plist."
+            exit 1
+          fi
+
+          BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleIdentifier' \
+              "$INFO_PLIST"
+          )"
+
+          EXECUTABLE_NAME="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "$INFO_PLIST"
+          )"
+
+          if [[ ! -f "$APP_PATH/$EXECUTABLE_NAME" ]]; then
+            echo "::error::The app executable is missing."
             exit 1
           fi
 
           echo "Built app: $APP_PATH"
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Executable: $EXECUTABLE_NAME"
+
           echo "path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Remove existing signing data
         working-directory: apps/mobile
@@ -244,7 +334,7 @@ jobs:
             -type d \
             -name '_CodeSignature' \
             -prune \
-            -exec rm -rf {} +
+            -exec rm -rf '{}' +
 
           find "$APP_PATH" \
             -type f \
@@ -256,6 +346,15 @@ jobs:
             -name 'CodeResources' \
             -delete
 
+          echo "Remaining signing-related files:"
+          find "$APP_PATH" \
+            \( \
+              -name '_CodeSignature' \
+              -o -name 'embedded.mobileprovision' \
+              -o -name 'CodeResources' \
+            \) \
+            -print || true
+
       - name: Package unsigned IPA
         working-directory: apps/mobile
         shell: bash
@@ -263,6 +362,8 @@ jobs:
           set -euo pipefail
 
           APP_PATH="${{ steps.app.outputs.path }}"
+          APP_NAME="$(basename "$APP_PATH")"
+
           OUTPUT_DIRECTORY="$PWD/output"
           PAYLOAD_DIRECTORY="$OUTPUT_DIRECTORY/Payload"
           IPA_PATH="$OUTPUT_DIRECTORY/T3-Code-unsigned.ipa"
@@ -272,7 +373,7 @@ jobs:
 
           /usr/bin/ditto \
             "$APP_PATH" \
-            "$PAYLOAD_DIRECTORY/$(basename "$APP_PATH")"
+            "$PAYLOAD_DIRECTORY/$APP_NAME"
 
           cd "$OUTPUT_DIRECTORY"
 
@@ -284,14 +385,24 @@ jobs:
             Payload \
             "$IPA_PATH"
 
-          echo "Created IPA:"
+          if [[ ! -s "$IPA_PATH" ]]; then
+            echo "::error::IPA creation failed or produced an empty file."
+            exit 1
+          fi
+
+          echo "Created unsigned IPA:"
           ls -lh "$IPA_PATH"
 
-          echo "IPA contents:"
+          echo "IPA root contents:"
           unzip -l "$IPA_PATH" | head -100
 
+          if ! unzip -l "$IPA_PATH" | grep -q "Payload/.*\.app/Info.plist"; then
+            echo "::error::The IPA does not contain a valid Payload app."
+            exit 1
+          fi
+
       - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: T3-Code-iOS-Unsigned
           path: apps/mobile/output/T3-Code-unsigned.ipa
@@ -301,12 +412,21 @@ jobs:
 
       - name: Upload build logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: T3-Code-iOS-Build-Logs
           path: |
+            apps/mobile/expo-prebuild.log
+            apps/mobile/pod-install.log
+            apps/mobile/xcode-build-settings.log
+            apps/mobile/swiftpm-resolve.log
             apps/mobile/xcodebuild.log
+            apps/mobile/ios/Podfile
             apps/mobile/ios/Podfile.lock
+            apps/mobile/ios/*.xcodeproj/project.pbxproj
+            apps/mobile/ios/*.xcodeproj/xcshareddata/xcschemes/*.xcscheme
+            apps/mobile/ios/*.xcworkspace/contents.xcworkspacedata
             apps/mobile/ios/*.xcworkspace/xcshareddata/swiftpm/Package.resolved
+            apps/mobile/build/SourcePackages/checkouts/*/Package.swift
           if-no-files-found: ignore
           retention-days: 7
